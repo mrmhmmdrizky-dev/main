@@ -75,12 +75,40 @@ function Get-ToolAsset {
     return $null
 }
 
+function Set-UnlockedLockScreenImage {
+    param([string]$ImagePath)
+    # Mengubah gambar Lock Screen via Windows Runtime API tanpa mengunci policy PersonalizationCSP
+    $winRtCode = @"
+[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null
+[Windows.System.UserProfile.LockScreen,Windows.System.UserProfile,ContentType=WindowsRuntime] | Out-Null
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+`$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    `$_.Name -eq 'AsTask' -and `$_.GetParameters().Count -eq 1 -and `$_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation``1'
+})[0]
+Function Await(`$WinRtTask, `$ResultType) {
+    `$asTask = `$asTaskGeneric.MakeGenericMethod(`$ResultType)
+    `$netTask = `$asTask.Invoke(`$null, @(`$WinRtTask))
+    `$netTask.Wait(-1) | Out-Null
+    `$netTask.Result
+}
+Function AwaitAction(`$WinRtAction) {
+    `$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        `$_.Name -eq 'AsTask' -and `$_.GetParameters().Count -eq 1 -and `$_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction'
+    })[0]
+    `$netTask = `$asTask.Invoke(`$null, @(`$WinRtAction))
+    `$netTask.Wait(-1) | Out-Null
+}
+`$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync('$ImagePath')) ([Windows.Storage.StorageFile])
+AwaitAction ([Windows.System.UserProfile.LockScreen]::SetImageFileAsync(`$file))
+"@
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $winRtCode | Out-Null
+}
+
 function Resolve-AppIcon {
     param([string]$RawPath)
     if ([string]::IsNullOrWhiteSpace($RawPath)) { return $null }
     try {
         $clean = $RawPath.Trim()
-        # Hilangkan index ikon seperti ",0" atau ",-101" di akhir DisplayIcon
         if ($clean -match '^"?([^"]+\.(exe|ico|dll|lnk))"?') {
             $clean = $Matches[1]
         } elseif ($clean -match '^([^\s]+\.(exe|ico|dll|lnk))') {
@@ -88,7 +116,6 @@ function Resolve-AppIcon {
         }
         $clean = [Environment]::ExpandEnvironmentVariables($clean.Trim('"'))
 
-        # Jika file .lnk (shortcut di folder Startup), ambil TargetPath-nya
         if ($clean -like "*.lnk" -and (Test-Path $clean)) {
             $wsh = New-Object -ComObject WScript.Shell
             $sc = $wsh.CreateShortcut($clean)
@@ -242,7 +269,7 @@ $AppCatalog = [ordered]@{
 
 # --- FORM UTAMA ---
 $MainForm = New-Object System.Windows.Forms.Form
-$MainForm.Text = "IT Administration and ISO Compliance Suite v7.1 (GitHub Ready)"
+$MainForm.Text = "IT Administration and ISO Compliance Suite v7.3 (GitHub Ready)"
 $MainForm.Size = New-Object System.Drawing.Size(1080, 760)
 $MainForm.StartPosition = "CenterScreen"
 $MainForm.FormBorderStyle = "FixedSingle"
@@ -257,7 +284,7 @@ $HeaderPanel.BackColor = [System.Drawing.Color]::FromArgb(24, 34, 56)
 $MainForm.Controls.Add($HeaderPanel)
 
 $LblTitle = New-Object System.Windows.Forms.Label
-$LblTitle.Text = "IT ADMINISTRATION, WINUTIL AND ISO COMPLIANCE SUITE v7.1"
+$LblTitle.Text = "IT ADMINISTRATION, WINUTIL AND ISO COMPLIANCE SUITE v7.3"
 $LblTitle.ForeColor = [System.Drawing.Color]::White
 $LblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 12.5, [System.Drawing.FontStyle]::Bold)
 $LblTitle.Location = New-Object System.Drawing.Point(16, 13)
@@ -745,25 +772,58 @@ $btnSetWP.Add_Click({
     $wpFile = Get-ToolAsset -FileName "wp.png"
     if (-not $wpFile) { return }
     try {
-        $tf = "C:\Users\Public\Pictures\wp.png"; Copy-Item $wpFile $tf -Force
-        Set-ItemProperty "HKCU:\Control Panel\Desktop" "Wallpaper" $tf; Set-ItemProperty "HKCU:\Control Panel\Desktop" "WallpaperStyle" "2"
-        $lr = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"; if (!(Test-Path $lr)) { New-Item $lr -Force | Out-Null }
-        Set-ItemProperty $lr "LockScreenImagePath" $tf -Type String; Set-ItemProperty $lr "LockScreenImageUrl" $tf -Type String; Set-ItemProperty $lr "LockScreenImageStatus" 1 -Type DWORD
+        $tf = "C:\Users\Public\Pictures\wp.png"
+        Copy-Item $wpFile $tf -Force
+        # 1. Terapkan Desktop Wallpaper (Unlocked)
+        Set-ItemProperty "HKCU:\Control Panel\Desktop" "Wallpaper" $tf
+        Set-ItemProperty "HKCU:\Control Panel\Desktop" "WallpaperStyle" "2"
         Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class WP { [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni); }' -ErrorAction SilentlyContinue
-        [WP]::SystemParametersInfo(20, 0, $tf, 3) | Out-Null; Write-Log "Wallpaper dan Lock Screen diterapkan!" "SUCCESS"
+        [WP]::SystemParametersInfo(20, 0, $tf, 3) | Out-Null
+
+        # 2. Terapkan Lock Screen Image via WinRT API (tanpa mengunci PersonalizationCSP)
+        Set-UnlockedLockScreenImage -ImagePath $tf
+
+        Write-Log "Wallpaper dan Lock Screen diterapkan (Status: Unlocked)!" "SUCCESS"
     } catch { Write-Log $_.Exception.Message "ERROR" }
 })
 
 $btnLockWP = New-ActionButton $TabLocal "Lock Wallpaper" 350 68 150 38
 $btnLockWP.Add_Click({
-    @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System") | ForEach-Object { if(!(Test-Path $_)){New-Item $_ -Force|Out-Null}; Set-ItemProperty $_ "NoChangingWallPaper" 1 -Type DWORD -ErrorAction SilentlyContinue }
-    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; Write-Log "Wallpaper DI-LOCK." "WARN"
+    # 1. Kunci Desktop Wallpaper
+    @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System") | ForEach-Object {
+        if (!(Test-Path $_)) { New-Item $_ -Force | Out-Null }
+        Set-ItemProperty $_ "NoChangingWallPaper" 1 -Type DWORD -ErrorAction SilentlyContinue
+    }
+    # 2. Kunci Lock Screen (Group Policy + PersonalizationCSP)
+    $persPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
+    if (!(Test-Path $persPol)) { New-Item $persPol -Force | Out-Null }
+    Set-ItemProperty $persPol "NoChangingLockScreen" 1 -Type DWORD -ErrorAction SilentlyContinue
+
+    $tf = "C:\Users\Public\Pictures\wp.png"
+    if (-not (Test-Path $tf)) {
+        $dl = Get-ToolAsset -FileName "wp.png"
+        if ($dl) { Copy-Item $dl $tf -Force }
+    }
+    if (Test-Path $tf) {
+        $lr = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+        if (!(Test-Path $lr)) { New-Item $lr -Force | Out-Null }
+        Set-ItemProperty $lr "LockScreenImagePath" $tf -Type String
+        Set-ItemProperty $lr "LockScreenImageUrl" $tf -Type String
+        Set-ItemProperty $lr "LockScreenImageStatus" 1 -Type DWORD
+    }
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Write-Log "Wallpaper Desktop dan Lock Screen DI-LOCK." "WARN"
 })
 
 $btnUnlockWP = New-ActionButton $TabLocal "Unlock Wallpaper" 510 68 150 38
 $btnUnlockWP.Add_Click({
-    @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System") | ForEach-Object { if(Test-Path $_){Set-ItemProperty $_ "NoChangingWallPaper" 0 -Type DWORD -ErrorAction SilentlyContinue} }
-    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; Write-Log "Wallpaper DI-UNLOCK." "SUCCESS"
+    @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System") | ForEach-Object {
+        if (Test-Path $_) { Remove-ItemProperty $_ "NoChangingWallPaper" -ErrorAction SilentlyContinue }
+    }
+    Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" -Name "NoChangingLockScreen" -ErrorAction SilentlyContinue
+    Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP" -Recurse -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Write-Log "Wallpaper Desktop dan Lock Screen DI-UNLOCK." "SUCCESS"
 })
 
 $btnDefender = New-ActionButton $TabLocal "Aktifkan Defender dan Firewall" 680 68 330 38
@@ -829,7 +889,7 @@ $GrpISO.Size = New-Object System.Drawing.Size(485, 232)
 $TabLocal.Controls.Add($GrpISO)
 
 $LblISODesc = New-Object System.Windows.Forms.Label
-$LblISODesc.Text = "Otomatis menerapkan 6 kebijakan standar ISO (skip jika sudah aktif):`r`n1. Block USB Storage`r`n2. Wallpaper dan Lock Screen (Auto-download wp.png jika belum ada)`r`n3. Lock Wallpaper`r`n4. Aktifkan Defender dan Firewall`r`n5. Buat/Update User IT_ADMIN`r`n6. Turunkan Karyawan ke Standard User"
+$LblISODesc.Text = "Otomatis menerapkan 6 kebijakan standar ISO (skip jika sudah aktif):`r`n1. Block USB Storage`r`n2. Wallpaper dan Lock Screen (Auto-download wp.png jika belum ada)`r`n3. Lock Wallpaper & Lock Screen`r`n4. Aktifkan Defender dan Firewall`r`n5. Buat/Update User IT_ADMIN`r`n6. Turunkan Karyawan ke Standard User"
 $LblISODesc.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
 $LblISODesc.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
 $LblISODesc.Location = New-Object System.Drawing.Point(15, 24)
@@ -852,9 +912,8 @@ $btnApplyISO.Add_Click({
 
     $targetWP = "C:\Users\Public\Pictures\wp.png"
     $curWP = (Get-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "Wallpaper" -ErrorAction SilentlyContinue).Wallpaper
-    $curLock = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP" -Name "LockScreenImagePath" -ErrorAction SilentlyContinue).LockScreenImagePath
-    if (($curWP -eq $targetWP) -and ($curLock -eq $targetWP) -and (Test-Path $targetWP)) {
-        Write-Log "[2/6] Wallpaper dan Lock Screen sudah terpasang -> Melewati..." "SKIP"
+    if (($curWP -eq $targetWP) -and (Test-Path $targetWP)) {
+        Write-Log "[2/6] File Wallpaper dan Lock Screen sudah terpasang -> Melewati..." "SKIP"
     } else {
         $wpFile = Get-ToolAsset -FileName "wp.png"
         if (-not $wpFile) { Write-Log "[2/6] File 'wp.png' gagal didapatkan -> Melewati..." "WARN" }
@@ -863,13 +922,9 @@ $btnApplyISO.Add_Click({
                 Copy-Item -Path $wpFile -Destination $targetWP -Force -ErrorAction Stop
                 Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "Wallpaper" -Value $targetWP
                 Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "WallpaperStyle" -Value "2"
-                $lr = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
-                if (-not (Test-Path $lr)) { New-Item -Path $lr -Force | Out-Null }
-                Set-ItemProperty -Path $lr -Name "LockScreenImagePath" -Value $targetWP -Type String
-                Set-ItemProperty -Path $lr -Name "LockScreenImageUrl" -Value $targetWP -Type String
-                Set-ItemProperty -Path $lr -Name "LockScreenImageStatus" -Value 1 -Type DWORD
                 Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class WPISO { [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni); }' -ErrorAction SilentlyContinue
                 [WPISO]::SystemParametersInfo(20, 0, $targetWP, 3) | Out-Null
+                Set-UnlockedLockScreenImage -ImagePath $targetWP
                 Write-Log "[2/6] Wallpaper dan Lock Screen (wp.png) berhasil diterapkan!" "SUCCESS"
             } catch { Write-Log "[2/6] Gagal menerapkan wallpaper: $($_.Exception.Message)" "ERROR" }
         }
@@ -877,16 +932,29 @@ $btnApplyISO.Add_Click({
 
     $wpPol1 = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop" -Name "NoChangingWallPaper" -ErrorAction SilentlyContinue).NoChangingWallPaper
     $wpPol2 = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop" -Name "NoChangingWallPaper" -ErrorAction SilentlyContinue).NoChangingWallPaper
-    if (($wpPol1 -eq 1) -and ($wpPol2 -eq 1)) {
-        Write-Log "[3/6] Lock Wallpaper sudah aktif -> Melewati..." "SKIP"
+    $lsPol  = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" -Name "NoChangingLockScreen" -ErrorAction SilentlyContinue).NoChangingLockScreen
+    $cspOk  = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+    if (($wpPol1 -eq 1) -and ($wpPol2 -eq 1) -and ($lsPol -eq 1) -and $cspOk) {
+        Write-Log "[3/6] Lock Wallpaper & Lock Screen sudah aktif -> Melewati..." "SKIP"
     } else {
         try {
             @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop","HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System") | ForEach-Object {
                 if (-not (Test-Path $_)) { New-Item $_ -Force | Out-Null }
                 Set-ItemProperty $_ -Name "NoChangingWallPaper" -Value 1 -Type DWORD -ErrorAction SilentlyContinue
             }
+            $persPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
+            if (-not (Test-Path $persPol)) { New-Item $persPol -Force | Out-Null }
+            Set-ItemProperty $persPol -Name "NoChangingLockScreen" -Value 1 -Type DWORD -ErrorAction SilentlyContinue
+
+            if (Test-Path $targetWP) {
+                $lr = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+                if (-not (Test-Path $lr)) { New-Item -Path $lr -Force | Out-Null }
+                Set-ItemProperty -Path $lr -Name "LockScreenImagePath" -Value $targetWP -Type String
+                Set-ItemProperty -Path $lr -Name "LockScreenImageUrl" -Value $targetWP -Type String
+                Set-ItemProperty -Path $lr -Name "LockScreenImageStatus" -Value 1 -Type DWORD
+            }
             Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-            Write-Log "[3/6] Wallpaper berhasil DI-LOCK!" "SUCCESS"
+            Write-Log "[3/6] Wallpaper Desktop dan Lock Screen berhasil DI-LOCK!" "SUCCESS"
         } catch { Write-Log "[3/6] Gagal Lock Wallpaper: $($_.Exception.Message)" "ERROR" }
     }
 
@@ -1066,7 +1134,7 @@ $StatusLabels = @{}
 $StatusFields = @(
     @{ Key="PCName";       Label="Nama PC / Hostname" },
     @{ Key="USBStatus";    Label="Status Block USB Storage" },
-    @{ Key="WPStatus";     Label="Status Lock Wallpaper" },
+    @{ Key="WPStatus";     Label="Status Lock Wallpaper & LS" },
     @{ Key="DefStatus";    Label="Status Defender dan Firewall" },
     @{ Key="ITAdminStat";  Label="Status Profil IT_ADMIN" },
     @{ Key="EmpStat";      Label="Status Profil Karyawan" },
@@ -1141,9 +1209,14 @@ $RefreshISODashboard = {
 
     $wp1 = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop" -Name "NoChangingWallPaper" -ErrorAction SilentlyContinue).NoChangingWallPaper
     $wp2 = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop" -Name "NoChangingWallPaper" -ErrorAction SilentlyContinue).NoChangingWallPaper
-    if ($wp1 -eq 1 -or $wp2 -eq 1) {
-        $StatusLabels["WPStatus"].Text = "TERKUNCI / LOCKED (Sesuai ISO)"
+    $ls1 = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" -Name "NoChangingLockScreen" -ErrorAction SilentlyContinue).NoChangingLockScreen
+    $csp = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+    if (($wp1 -eq 1 -or $wp2 -eq 1) -and ($ls1 -eq 1 -and $csp)) {
+        $StatusLabels["WPStatus"].Text = "TERKUNCI / LOCKED (Desktop & Lock Screen)"
         $StatusLabels["WPStatus"].ForeColor = [System.Drawing.Color]::ForestGreen
+    } elseif ($wp1 -eq 1 -or $wp2 -eq 1 -or $ls1 -eq 1 -or $csp) {
+        $StatusLabels["WPStatus"].Text = "TERKUNCI SEBAGIAN (Partial Lock)"
+        $StatusLabels["WPStatus"].ForeColor = [System.Drawing.Color]::DarkOrange
     } else {
         $StatusLabels["WPStatus"].Text = "TIDAK TERKUNCI / UNLOCKED"
         $StatusLabels["WPStatus"].ForeColor = [System.Drawing.Color]::Crimson
@@ -1249,7 +1322,6 @@ $TabManage.Text = "6. Startup & Uninstall Apps"
 $TabManage.BackColor = [System.Drawing.Color]::WhiteSmoke
 $TabControl.Controls.Add($TabManage)
 
-# ImageList default (20x20 px) untuk ikon aplikasi Startup & Uninstall
 $DefaultAppBitmap = ([System.Drawing.SystemIcons]::Application).ToBitmap()
 
 $StartupImageList = New-Object System.Windows.Forms.ImageList
@@ -1492,7 +1564,6 @@ $LoadInstalledApps = {
         $ver = if ($app.DisplayVersion) { $app.DisplayVersion.Trim() } else { "-" }
         $pub = if ($app.Publisher) { $app.Publisher.Trim() } else { "-" }
 
-        # Cari ikon dari DisplayIcon, lalu fallback ke InstallLocation atau UninstallString
         $iconCandidate = $app.DisplayIcon
         if ([string]::IsNullOrWhiteSpace($iconCandidate) -and -not [string]::IsNullOrWhiteSpace($app.InstallLocation) -and (Test-Path $app.InstallLocation)) {
             $firstExe = Get-ChildItem -Path $app.InstallLocation -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1598,7 +1669,7 @@ $MainForm.Add_Shown({
     & $RefreshISODashboard
     & $LoadStartupApps
     & $LoadInstalledApps
-    Write-Log "IT Administration and ISO Compliance Suite v7.1 siap! Folder aset: $ScriptDir" "SUCCESS"
+    Write-Log "IT Administration and ISO Compliance Suite v7.3 siap! Folder aset: $ScriptDir" "SUCCESS"
 })
 
 [void]$MainForm.ShowDialog()
