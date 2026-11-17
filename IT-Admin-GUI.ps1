@@ -1,4 +1,4 @@
-﻿# Auto-Elevate ke Administrator jika dijalankan dari terminal user biasa
+# Auto-Elevate ke Administrator jika dijalankan dari terminal user biasa
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     if ($PSCommandPath) {
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
