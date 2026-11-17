@@ -26,10 +26,6 @@ $AssetUrls = @{
     "FortiClientVPN.exe" = "https://drive.usercontent.google.com/download?id=1uw-_ceCJneaOxgpYOBQO2QeXfeAhjcNh&export=download&confirm=t"
 }
 
-$WpSource    = Join-Path -Path $ScriptDir -ChildPath "wp.png"
-$FcInstaller = Join-Path -Path $ScriptDir -ChildPath "FortiClientVPN.exe"
-$VpnMaster   = Join-Path -Path $ScriptDir -ChildPath "vpn_master.conf"
-
 function Write-Log {
     param([string]$Message, [string]$Type = "INFO")
     $timestamp = (Get-Date).ToString("HH:mm:ss")
@@ -76,6 +72,36 @@ function Get-ToolAsset {
     } catch {
         Write-Log "Gagal mengunduh '$FileName': $($_.Exception.Message)" "ERROR"
     }
+    return $null
+}
+
+function Resolve-AppIcon {
+    param([string]$RawPath)
+    if ([string]::IsNullOrWhiteSpace($RawPath)) { return $null }
+    try {
+        $clean = $RawPath.Trim()
+        # Hilangkan index ikon seperti ",0" atau ",-101" di akhir DisplayIcon
+        if ($clean -match '^"?([^"]+\.(exe|ico|dll|lnk))"?') {
+            $clean = $Matches[1]
+        } elseif ($clean -match '^([^\s]+\.(exe|ico|dll|lnk))') {
+            $clean = $Matches[1]
+        }
+        $clean = [Environment]::ExpandEnvironmentVariables($clean.Trim('"'))
+
+        # Jika file .lnk (shortcut di folder Startup), ambil TargetPath-nya
+        if ($clean -like "*.lnk" -and (Test-Path $clean)) {
+            $wsh = New-Object -ComObject WScript.Shell
+            $sc = $wsh.CreateShortcut($clean)
+            if ($sc.TargetPath -and (Test-Path $sc.TargetPath)) {
+                $clean = $sc.TargetPath
+            }
+        }
+
+        if (Test-Path $clean -PathType Leaf) {
+            $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($clean)
+            if ($ico) { return $ico.ToBitmap() }
+        }
+    } catch {}
     return $null
 }
 
@@ -216,7 +242,7 @@ $AppCatalog = [ordered]@{
 
 # --- FORM UTAMA ---
 $MainForm = New-Object System.Windows.Forms.Form
-$MainForm.Text = "IT Administration and ISO Compliance Suite v6.9 (GitHub Ready)"
+$MainForm.Text = "IT Administration and ISO Compliance Suite v7.1 (GitHub Ready)"
 $MainForm.Size = New-Object System.Drawing.Size(1080, 760)
 $MainForm.StartPosition = "CenterScreen"
 $MainForm.FormBorderStyle = "FixedSingle"
@@ -231,7 +257,7 @@ $HeaderPanel.BackColor = [System.Drawing.Color]::FromArgb(24, 34, 56)
 $MainForm.Controls.Add($HeaderPanel)
 
 $LblTitle = New-Object System.Windows.Forms.Label
-$LblTitle.Text = "IT ADMINISTRATION, WINUTIL AND ISO COMPLIANCE SUITE"
+$LblTitle.Text = "IT ADMINISTRATION, WINUTIL AND ISO COMPLIANCE SUITE v7.1"
 $LblTitle.ForeColor = [System.Drawing.Color]::White
 $LblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 12.5, [System.Drawing.FontStyle]::Bold)
 $LblTitle.Location = New-Object System.Drawing.Point(16, 13)
@@ -1215,10 +1241,364 @@ $btnJumpApplyISO = New-ActionButton $TabISO "Jalankan Terapkan ISO Sekarang" 270
 $btnJumpApplyISO.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
 $btnJumpApplyISO.Add_Click({ $btnApplyISO.PerformClick() })
 
+# ==============================================================================
+# TAB 6: STARTUP APPS & UNINSTALL APPS (DENGAN IKON ASLI & MULTI-SELECT)
+# ==============================================================================
+$TabManage = New-Object System.Windows.Forms.TabPage
+$TabManage.Text = "6. Startup & Uninstall Apps"
+$TabManage.BackColor = [System.Drawing.Color]::WhiteSmoke
+$TabControl.Controls.Add($TabManage)
+
+# ImageList default (20x20 px) untuk ikon aplikasi Startup & Uninstall
+$DefaultAppBitmap = ([System.Drawing.SystemIcons]::Application).ToBitmap()
+
+$StartupImageList = New-Object System.Windows.Forms.ImageList
+$StartupImageList.ImageSize = New-Object System.Drawing.Size(20, 20)
+$StartupImageList.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
+
+$UninstallImageList = New-Object System.Windows.Forms.ImageList
+$UninstallImageList.ImageSize = New-Object System.Drawing.Size(20, 20)
+$UninstallImageList.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
+
+# --- PANEL KIRI: STARTUP APPS MANAGER ---
+$GrpStartup = New-Object System.Windows.Forms.GroupBox
+$GrpStartup.Text = "Startup Apps Manager (Multi-Select)"
+$GrpStartup.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+$GrpStartup.Location = New-Object System.Drawing.Point(12, 10)
+$GrpStartup.Size = New-Object System.Drawing.Size(495, 452)
+$TabManage.Controls.Add($GrpStartup)
+
+$TxtSearchStartup = New-Object System.Windows.Forms.TextBox
+$TxtSearchStartup.Location = New-Object System.Drawing.Point(12, 26)
+$TxtSearchStartup.Size = New-Object System.Drawing.Size(365, 24)
+$TxtSearchStartup.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$GrpStartup.Controls.Add($TxtSearchStartup)
+
+$btnRefreshStartup = New-ActionButton $GrpStartup "Refresh" 385 24 96 26
+$btnRefreshStartup.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+
+$LvStartup = New-Object System.Windows.Forms.ListView
+$LvStartup.Location = New-Object System.Drawing.Point(12, 58)
+$LvStartup.Size = New-Object System.Drawing.Size(469, 328)
+$LvStartup.View = [System.Windows.Forms.View]::Details
+$LvStartup.CheckBoxes = $true
+$LvStartup.FullRowSelect = $true
+$LvStartup.GridLines = $true
+$LvStartup.SmallImageList = $StartupImageList
+$LvStartup.Font = New-Object System.Drawing.Font("Segoe UI", 8.8)
+$LvStartup.Columns.Add("Aplikasi Startup", 265) | Out-Null
+$LvStartup.Columns.Add("Status", 85) | Out-Null
+$LvStartup.Columns.Add("Lokasi", 110) | Out-Null
+$GrpStartup.Controls.Add($LvStartup)
+
+$script:StartupItemsCache = @()
+
+function Get-StartupApprovedState {
+    param([string]$ApprovedPath, [string]$EntryName)
+    if (-not (Test-Path $ApprovedPath)) { return $true }
+    $val = (Get-ItemProperty -Path $ApprovedPath -Name $EntryName -ErrorAction SilentlyContinue).$EntryName
+    if ($val -is [byte[]] -and $val.Length -ge 1) {
+        return (($val[0] -band 1) -eq 0)
+    }
+    return $true
+}
+
+function Set-StartupApprovedState {
+    param([string]$ApprovedPath, [string]$EntryName, [bool]$Enable)
+    if (-not (Test-Path $ApprovedPath)) { New-Item -Path $ApprovedPath -Force | Out-Null }
+    $bytes = New-Object byte[] 12
+    $bytes[0] = if ($Enable) { 2 } else { 3 }
+    Set-ItemProperty -Path $ApprovedPath -Name $EntryName -Value $bytes -Type Binary -ErrorAction Stop
+}
+
+$LoadStartupApps = {
+    $StartupImageList.Images.Clear()
+    $StartupImageList.Images.Add("default", $DefaultAppBitmap)
+
+    $list = New-Object System.Collections.Generic.List[PSObject]
+    $regSources = @(
+        @{ Scope="User (HKCU)"; RunPath="HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"; AppPath="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" },
+        @{ Scope="Machine (HKLM)"; RunPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; AppPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" },
+        @{ Scope="Machine 32-bit"; RunPath="HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"; AppPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32" }
+    )
+
+    $imgIdx = 1
+    foreach ($src in $regSources) {
+        if (Test-Path $src.RunPath) {
+            $props = (Get-Item $src.RunPath).Property
+            foreach ($pName in $props) {
+                $cmdVal = (Get-ItemProperty -Path $src.RunPath -Name $pName -ErrorAction SilentlyContinue).$pName
+                $isEnabled = Get-StartupApprovedState -ApprovedPath $src.AppPath -EntryName $pName
+                $bmp = Resolve-AppIcon -RawPath $cmdVal
+                $key = "default"
+                if ($bmp) {
+                    $key = "st_$imgIdx"
+                    $StartupImageList.Images.Add($key, $bmp)
+                    $imgIdx++
+                }
+                $list.Add([PSCustomObject]@{
+                    Name         = $pName
+                    Command      = $cmdVal
+                    Scope        = $src.Scope
+                    ApprovedPath = $src.AppPath
+                    Enabled      = $isEnabled
+                    IconKey      = $key
+                })
+            }
+        }
+    }
+
+    $folderSources = @(
+        @{ Scope="Folder User"; Dir="$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"; AppPath="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" },
+        @{ Scope="Folder AllUsers"; Dir="$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"; AppPath="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" }
+    )
+
+    foreach ($fsrc in $folderSources) {
+        if (Test-Path $fsrc.Dir) {
+            Get-ChildItem -Path $fsrc.Dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "desktop.ini" } | ForEach-Object {
+                $isEnabled = Get-StartupApprovedState -ApprovedPath $fsrc.AppPath -EntryName $_.Name
+                $bmp = Resolve-AppIcon -RawPath $_.FullName
+                $key = "default"
+                if ($bmp) {
+                    $key = "st_$imgIdx"
+                    $StartupImageList.Images.Add($key, $bmp)
+                    $imgIdx++
+                }
+                $list.Add([PSCustomObject]@{
+                    Name         = $_.Name
+                    Command      = $_.FullName
+                    Scope        = $fsrc.Scope
+                    ApprovedPath = $fsrc.AppPath
+                    Enabled      = $isEnabled
+                    IconKey      = $key
+                })
+            }
+        }
+    }
+
+    $script:StartupItemsCache = $list.ToArray()
+    & $RenderStartupList
+}
+
+$RenderStartupList = {
+    $filter = $TxtSearchStartup.Text.Trim()
+    $LvStartup.BeginUpdate()
+    $LvStartup.Items.Clear()
+    foreach ($item in $script:StartupItemsCache) {
+        if ($filter -and ($item.Name -notlike "*$filter*") -and ($item.Command -notlike "*$filter*")) { continue }
+        $lvi = New-Object System.Windows.Forms.ListViewItem($item.Name)
+        $lvi.ImageKey = $item.IconKey
+        $lvi.Tag = $item
+        $statusStr = if ($item.Enabled) { "AKTIF" } else { "NONAKTIF" }
+        $lvi.SubItems.Add($statusStr) | Out-Null
+        $lvi.SubItems.Add($item.Scope) | Out-Null
+        if (-not $item.Enabled) { $lvi.ForeColor = [System.Drawing.Color]::DimGray }
+        $LvStartup.Items.Add($lvi) | Out-Null
+    }
+    $LvStartup.EndUpdate()
+}
+
+$TxtSearchStartup.Add_TextChanged($RenderStartupList)
+$btnRefreshStartup.Add_Click({ & $LoadStartupApps; Write-Log "Daftar Startup Apps diperbarui ($($script:StartupItemsCache.Count) item)." "INFO" })
+
+function Apply-StartupSelection {
+    param([bool]$TargetEnable)
+    if ($LvStartup.CheckedItems.Count -eq 0) {
+        Write-Log "Centang minimal 1 aplikasi startup terlebih dahulu!" "WARN"
+        return
+    }
+    $actionLabel = if ($TargetEnable) { "MENGAKTIFKAN" } else { "MENONAKTIFKAN" }
+    Write-Log "$actionLabel $($LvStartup.CheckedItems.Count) aplikasi startup terpilih..." "INFO"
+
+    foreach ($lvi in $LvStartup.CheckedItems) {
+        $obj = $lvi.Tag
+        if (-not $obj) { continue }
+        try {
+            Set-StartupApprovedState -ApprovedPath $obj.ApprovedPath -EntryName $obj.Name -Enable $TargetEnable
+            $statusTxt = if ($TargetEnable) { "DIAKTIFKAN" } else { "DINONAKTIFKAN" }
+            Write-Log "Startup '$($obj.Name)' [$($obj.Scope)] berhasil $statusTxt." "SUCCESS"
+        } catch {
+            Write-Log "Gagal mengubah startup '$($obj.Name)': $($_.Exception.Message)" "ERROR"
+        }
+    }
+    & $LoadStartupApps
+}
+
+$btnEnableStartup = New-ActionButton $GrpStartup "Enable Selected" 12 396 150 40 ([System.Drawing.Color]::FromArgb(39, 174, 96))
+$btnEnableStartup.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnEnableStartup.Add_Click({ Apply-StartupSelection -TargetEnable $true })
+
+$btnDisableStartup = New-ActionButton $GrpStartup "Disable Selected" 170 396 155 40 ([System.Drawing.Color]::FromArgb(192, 57, 43))
+$btnDisableStartup.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnDisableStartup.Add_Click({ Apply-StartupSelection -TargetEnable $false })
+
+$btnClearStartupSel = New-ActionButton $GrpStartup "Clear Check" 333 396 148 40
+$btnClearStartupSel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+$btnClearStartupSel.Add_Click({
+    foreach ($it in $LvStartup.Items) { $it.Checked = $false }
+})
+
+# --- PANEL KANAN: UNINSTALL INSTALLED APPS ---
+$GrpUninstall = New-Object System.Windows.Forms.GroupBox
+$GrpUninstall.Text = "Uninstall Installed Apps (Multi-Select)"
+$GrpUninstall.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+$GrpUninstall.Location = New-Object System.Drawing.Point(520, 10)
+$GrpUninstall.Size = New-Object System.Drawing.Size(502, 452)
+$TabManage.Controls.Add($GrpUninstall)
+
+$TxtSearchUninstall = New-Object System.Windows.Forms.TextBox
+$TxtSearchUninstall.Location = New-Object System.Drawing.Point(12, 26)
+$TxtSearchUninstall.Size = New-Object System.Drawing.Size(372, 24)
+$TxtSearchUninstall.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$GrpUninstall.Controls.Add($TxtSearchUninstall)
+
+$btnRefreshUninstall = New-ActionButton $GrpUninstall "Refresh" 392 24 96 26
+$btnRefreshUninstall.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+
+$LvUninstall = New-Object System.Windows.Forms.ListView
+$LvUninstall.Location = New-Object System.Drawing.Point(12, 58)
+$LvUninstall.Size = New-Object System.Drawing.Size(476, 328)
+$LvUninstall.View = [System.Windows.Forms.View]::Details
+$LvUninstall.CheckBoxes = $true
+$LvUninstall.FullRowSelect = $true
+$LvUninstall.GridLines = $true
+$LvUninstall.SmallImageList = $UninstallImageList
+$LvUninstall.Font = New-Object System.Drawing.Font("Segoe UI", 8.8)
+$LvUninstall.Columns.Add("Nama Aplikasi", 250) | Out-Null
+$LvUninstall.Columns.Add("Versi", 80) | Out-Null
+$LvUninstall.Columns.Add("Publisher", 135) | Out-Null
+$GrpUninstall.Controls.Add($LvUninstall)
+
+$script:InstalledAppsCache = @()
+
+$LoadInstalledApps = {
+    $UninstallImageList.Images.Clear()
+    $UninstallImageList.Images.Add("default", $DefaultAppBitmap)
+
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $rawApps = Get-ItemProperty $regPaths -ErrorAction SilentlyContinue | Where-Object {
+        (-not [string]::IsNullOrWhiteSpace($_.DisplayName)) -and
+        ($_.SystemComponent -ne 1) -and
+        (-not [string]::IsNullOrWhiteSpace($_.UninstallString) -or -not [string]::IsNullOrWhiteSpace($_.QuietUninstallString))
+    } | Sort-Object DisplayName -Unique
+
+    $list = New-Object System.Collections.Generic.List[PSObject]
+    $uIdx = 1
+    foreach ($app in $rawApps) {
+        $ver = if ($app.DisplayVersion) { $app.DisplayVersion.Trim() } else { "-" }
+        $pub = if ($app.Publisher) { $app.Publisher.Trim() } else { "-" }
+
+        # Cari ikon dari DisplayIcon, lalu fallback ke InstallLocation atau UninstallString
+        $iconCandidate = $app.DisplayIcon
+        if ([string]::IsNullOrWhiteSpace($iconCandidate) -and -not [string]::IsNullOrWhiteSpace($app.InstallLocation) -and (Test-Path $app.InstallLocation)) {
+            $firstExe = Get-ChildItem -Path $app.InstallLocation -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($firstExe) { $iconCandidate = $firstExe.FullName }
+        }
+        if ([string]::IsNullOrWhiteSpace($iconCandidate)) {
+            $iconCandidate = $app.UninstallString
+        }
+
+        $bmp = Resolve-AppIcon -RawPath $iconCandidate
+        $key = "default"
+        if ($bmp) {
+            $key = "un_$uIdx"
+            $UninstallImageList.Images.Add($key, $bmp)
+            $uIdx++
+        }
+
+        $list.Add([PSCustomObject]@{
+            DisplayName          = $app.DisplayName.Trim()
+            Version              = $ver
+            Publisher            = $pub
+            UninstallString      = $app.UninstallString
+            QuietUninstallString = $app.QuietUninstallString
+            IconKey              = $key
+        })
+    }
+    $script:InstalledAppsCache = $list.ToArray()
+    & $RenderUninstallList
+}
+
+$RenderUninstallList = {
+    $filter = $TxtSearchUninstall.Text.Trim()
+    $LvUninstall.BeginUpdate()
+    $LvUninstall.Items.Clear()
+    foreach ($app in $script:InstalledAppsCache) {
+        if ($filter -and ($app.DisplayName -notlike "*$filter*") -and ($app.Publisher -notlike "*$filter*")) { continue }
+        $lvi = New-Object System.Windows.Forms.ListViewItem($app.DisplayName)
+        $lvi.ImageKey = $app.IconKey
+        $lvi.Tag = $app
+        $lvi.SubItems.Add($app.Version) | Out-Null
+        $lvi.SubItems.Add($app.Publisher) | Out-Null
+        $LvUninstall.Items.Add($lvi) | Out-Null
+    }
+    $LvUninstall.EndUpdate()
+}
+
+$TxtSearchUninstall.Add_TextChanged($RenderUninstallList)
+$btnRefreshUninstall.Add_Click({ & $LoadInstalledApps; Write-Log "Daftar aplikasi terinstal diperbarui ($($script:InstalledAppsCache.Count) aplikasi)." "INFO" })
+
+$btnApplyUninstall = New-ActionButton $GrpUninstall "Uninstall Selected (Apply)" 12 396 290 40 ([System.Drawing.Color]::FromArgb(192, 57, 43))
+$btnApplyUninstall.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnApplyUninstall.Add_Click({
+    if ($LvUninstall.CheckedItems.Count -eq 0) {
+        Write-Log "Centang minimal 1 aplikasi yang ingin di-uninstall!" "WARN"
+        return
+    }
+
+    $targets = @()
+    foreach ($lvi in $LvUninstall.CheckedItems) {
+        if ($lvi.Tag) { $targets += $lvi.Tag }
+    }
+
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Apakah Anda yakin ingin menghapus $($targets.Count) aplikasi terpilih secara berurutan?",
+        "Konfirmasi Multi-Uninstall",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    Write-Log "Memulai proses uninstall $($targets.Count) aplikasi..." "INFO"
+    foreach ($app in $targets) {
+        Write-Log "Menghapus '$($app.DisplayName)'..." "INFO"
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($app.QuietUninstallString)) {
+                $p = Start-Process "cmd.exe" -ArgumentList "/c $($app.QuietUninstallString)" -NoNewWindow -Wait -PassThru
+                Write-Log "'$($app.DisplayName)' selesai diproses (ExitCode: $($p.ExitCode))." "SUCCESS"
+            } elseif ($app.UninstallString -match "MsiExec\.exe\s*[/\-][IX]\s*(\{[0-9A-Fa-f\-]+\})") {
+                $guid = $Matches[1]
+                $p = Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -NoNewWindow -Wait -PassThru
+                Write-Log "'$($app.DisplayName)' (MSI) di-uninstall (ExitCode: $($p.ExitCode))." "SUCCESS"
+            } else {
+                $uCmd = $app.UninstallString.Trim()
+                $p = Start-Process "cmd.exe" -ArgumentList "/c $uCmd" -Wait -PassThru
+                Write-Log "'$($app.DisplayName)' selesai dijalankan (ExitCode: $($p.ExitCode))." "SUCCESS"
+            }
+        } catch {
+            Write-Log "Gagal menghapus '$($app.DisplayName)': $($_.Exception.Message)" "ERROR"
+        }
+    }
+    Write-Log "Antrean uninstall selesai! Memperbarui daftar aplikasi..." "SUCCESS"
+    & $LoadInstalledApps
+})
+
+$btnClearUninstallSel = New-ActionButton $GrpUninstall "Clear Selection" 312 396 176 40
+$btnClearUninstallSel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+$btnClearUninstallSel.Add_Click({
+    foreach ($it in $LvUninstall.Items) { $it.Checked = $false }
+})
+
 Build-AppsUI
 $MainForm.Add_Shown({
     & $RefreshISODashboard
-    Write-Log "IT Administration and ISO Compliance Suite v6.9 siap! Folder aset: $ScriptDir" "SUCCESS"
+    & $LoadStartupApps
+    & $LoadInstalledApps
+    Write-Log "IT Administration and ISO Compliance Suite v7.1 siap! Folder aset: $ScriptDir" "SUCCESS"
 })
 
 [void]$MainForm.ShowDialog()
